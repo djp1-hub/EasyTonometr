@@ -5,3 +5,4 @@ fastapi==0.110.1
 uvicorn==0.29.0
 python-multipart==0.0.9
 pytesseract==0.3.13
+imutils==0.5.4
