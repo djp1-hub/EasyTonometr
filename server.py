@@ -19,8 +19,14 @@ async def analyze(file: UploadFile = File(...)):
         with open(temp_filename, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
+        ocr_processor = TonometerOCR('tessdata')
+
+        # Запускаем новый процесс распознавания
+        # Включаем debug=True, чтобы сохранялись промежуточные изображения
+        values = ocr_processor.process_with_7_segment_ocr(temp_filename, debug=True)
+        print(values)
         # Обработка изображения
-        values = ocr.process(temp_filename)
+        #values = ocr.process_full(temp_filename)
 
         # Удаляем временный файл
         os.remove(temp_filename)

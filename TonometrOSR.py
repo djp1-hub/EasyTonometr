@@ -1,41 +1,39 @@
 import cv2
 import numpy as np
-import pytesseract
+from imutils import contours
 import os
+import shutil
+
+
+# Вам может понадобиться pytesseract для старых методов, если вы их используете
+# import pytesseract
 
 class TonometerOCR:
-    def __init__(self, tessdata_dir, lang="ssd", psm=7):
+    # Конструктор остался прежним, хотя для нового метода он не используется
+    def __init__(self, tessdata_dir=None, lang="ssd", psm=7):
         self.tessdata_dir = tessdata_dir
         self.lang = lang
         self.psm = psm
 
-
-
+    # --- Ваши существующие вспомогательные методы (без изменений) ---
     def resize_to_width(self, image, width=100):
         h, w = image.shape[:2]
         scale = width / w
-
         new_dim = (width, int(h * scale))
         return cv2.resize(image, new_dim, interpolation=cv2.INTER_LINEAR)
 
     def invert(self, image):
         return cv2.bitwise_not(image)
 
-
-    def morf_closed(self, image):
-        img = cv2.imread("lcd_rectified.jpg")
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        gray_eq = clahe.apply(gray)
-        blurred = cv2.GaussianBlur(gray_eq, (5, 5), 0)
-        _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV)
-
-        # === 2. Морфология для склейки сегментов в цифры ===
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))  # вертикально удлинённое ядро
-        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
-        cv2.imwrite("debug_morph_closed.jpg", closed)
-        return closed
-
+    def order_points(self, pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
 
     def extract_lcd_screen(self, image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -48,6 +46,7 @@ class TonometerOCR:
         for cnt in contours:
             area = cv2.contourArea(cnt)
             approx = cv2.approxPolyDP(cnt, 0.02 * cv2.arcLength(cnt, True), True)
+            # Условие можно подбирать под ваши изображения
             if area > 50000 and len(approx) == 4:
                 if area > max_area:
                     lcd_cnt = approx
@@ -63,85 +62,158 @@ class TonometerOCR:
         width = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
         height = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
 
-        dst = np.array([
-            [0, 0],
-            [width - 1, 0],
-            [width - 1, height - 1],
-            [0, height - 1]
-        ], dtype="float32")
-
+        dst = np.array([[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]], dtype="float32")
         M = cv2.getPerspectiveTransform(rect, dst)
         warped = cv2.warpPerspective(image, M, (width, height))
 
-        cv2.imwrite("lcd_rectified.jpg", warped)
-        print("[INFO] LCD дисплей выровнен и сохранён: lcd_rectified.jpg")
+        print("[INFO] LCD дисплей выровнен.")
         return warped
 
-    def order_points(self, pts):
-        rect = np.zeros((4, 2), dtype="float32")
-        s = pts.sum(axis=1)
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
+    # --- Ваш метод morf_closed, немного улучшенный ---
+    def morf_closed(self, rectified_img):
+        gray = cv2.cvtColor(rectified_img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        gray_eq = clahe.apply(gray)
+        blurred = cv2.GaussianBlur(gray_eq, (5, 5), 0)
+        _, thresh = cv2.threshold(blurred, 100, 255, cv2.THRESH_BINARY_INV)
 
-        diff = np.diff(pts, axis=1)
-        rect[1] = pts[np.argmin(diff)]
-        rect[3] = pts[np.argmax(diff)]
-        return rect
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 5))
+        closed = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    def extract_values_from_lcd(self, lcd_img):
-        gray = cv2.cvtColor(lcd_img, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape
+        # Сохраняем для отладки, как и раньше
+        cv2.imwrite("debug_morph_closed.jpg", closed)
+        return closed
 
-        row1 = gray[int(0.20*h):int(0.45*h),  int(0.40 * w):w-int(0.09 * w)]
-        row2 = gray[int(0.45*h):int(0.7*h),   int(0.50 * w):w-int(0.09 * w)]
-        row3 = gray[int(0.7*h):int(0.90*h),   int(0.59 * w):w-int(0.085 * w)]
-        rows = [row1, row2, row3]
+    # +++ НАШ НОВЫЙ ВСТРОЕННЫЙ МЕТОД РАСПОЗНАВАНИЯ +++
+    def recognize_7_segment(self, binary_image, debug=False, debug_dir="debug_output"):
+        # Шаблоны цифр
+        DIGITS_TEMPLATES = {
+            "1": (0, 1, 1, 0, 0, 0, 0), "2": (1, 1, 0, 1, 1, 0, 1),
+            "3": (1, 1, 1, 1, 0, 0, 1), "4": (0, 1, 1, 0, 0, 1, 1),
+            "5": (1, 0, 1, 1, 0, 1, 1), "6": (1, 0, 1, 1, 1, 1, 1),
+            "7": (1, 1, 1, 0, 0, 0, 0), "8": (1, 1, 1, 1, 1, 1, 1),
+            "9": (1, 1, 1, 1, 0, 1, 1), "0": (1, 1, 1, 1, 1, 1, 0)
+        }
 
-        results = []
+        # Для отладки нам нужно 3-канальное изображение, чтобы рисовать цветные рамки
+        image_for_debug = cv2.cvtColor(binary_image, cv2.COLOR_GRAY2BGR)
+        h_img, w_img, _ = image_for_debug.shape
+
+        # Эрозия и поиск контуров
+        kernel = np.ones((3, 3), np.uint8)
+        eroded = cv2.erode(binary_image, kernel, iterations=1)
+        cnts = cv2.findContours(eroded.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+
+        if not cnts: return []
+
+        # Фильтрация контуров
+        digit_cnts = []
+        for c in cnts:
+            (x, y, w, h) = cv2.boundingRect(c)
+            if w < (w_img * 0.8) and h < (h_img * 0.8) and w > 5 and h > (h_img * 0.1):
+                digit_cnts.append(c)
+
+        if not digit_cnts: return []
+
+        if debug:
+            img_with_filtered = image_for_debug.copy()
+            for c in digit_cnts:
+                (x, y, w, h) = cv2.boundingRect(c)
+                cv2.rectangle(img_with_filtered, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.imwrite(os.path.join(debug_dir, "02_filtered_contours.png"), img_with_filtered)
+
+        # Сортировка по строкам
+        (sorted_cnts, _) = contours.sort_contours(digit_cnts, method="top-to-bottom")
+        rows = []
+        if sorted_cnts:
+            current_row = [sorted_cnts[0]]
+            for i in range(1, len(sorted_cnts)):
+                (x, y, w, h) = cv2.boundingRect(sorted_cnts[i])
+                (x_prev, y_prev, w_prev, h_prev) = cv2.boundingRect(current_row[0])
+                if abs(y - y_prev) < h_prev * 0.5:
+                    current_row.append(sorted_cnts[i])
+                else:
+                    rows.append(current_row)
+                    current_row = [sorted_cnts[i]]
+            rows.append(current_row)
+
+        # Распознавание и сбор результата
+        all_rows_text = []
         for i, row in enumerate(rows):
-            blur = cv2.GaussianBlur(row, (0, 0), sigmaX=10, sigmaY=10)
-            norm = cv2.addWeighted(row, 1.5, blur, -0.5, 0)
-            resize = self.resize_to_width(norm, 65)
+            (row_sorted, _) = contours.sort_contours(row, method="left-to-right")
+            current_row_text = ""
+            for c in row_sorted:
+                (x, y, w, h) = cv2.boundingRect(c)
+                digit = "?"
+                aspect_ratio = h / float(w) if w > 0 else 0
+                if aspect_ratio > 5.0:
+                    digit = "1"
+                else:
+                    roi = binary_image[y:y + h, x:x + w]
+                    # ... (остальная логика распознавания сегментов)
+                    (roi_h, roi_w) = roi.shape
+                    (dW, dH) = (int(roi_w * 0.3), int(roi_h * 0.15))
+                    dHC = int(roi_h * 0.05)
+                    segments = [
+                        ((0, 0), (w, dH)), ((w - dW, 0), (w, h // 2)), ((w - dW, h // 2), (w, h)),
+                        ((0, h - dH), (w, h)), ((0, h // 2), (dW, h)), ((0, 0), (dW, h // 2)),
+                        ((w // 2 - dW // 2, h // 2 - dHC), (w // 2 + dW // 2, h // 2 + dHC))
+                    ]
+                    on = [0] * len(segments)
+                    for j, ((xA, yA), (xB, yB)) in enumerate(segments):
+                        seg_roi = roi[yA:yB, xA:xB]
+                        total = cv2.countNonZero(seg_roi)
+                        area = (xB - xA) * (yB - yA)
+                        if area > 0 and total / float(area) > 0.4: on[j] = 1
+                    try:
+                        digit = list(DIGITS_TEMPLATES.keys())[list(DIGITS_TEMPLATES.values()).index(tuple(on))]
+                    except ValueError:
+                        pass
+                current_row_text += digit
+            all_rows_text.append(current_row_text)
+        return all_rows_text
 
-            filename = f"ocr_row_{i+1}.jpg"
-            cv2.imwrite(filename, resize)
-            print(f"[DEBUG] Сохранил {filename}")
+    # +++ НОВЫЙ ГЛАВНЫЙ МЕТОД ДЛЯ ЗАПУСКА +++
+    def process_with_7_segment_ocr(self, image_path, debug=False):
+        # Подготовка папки для отладки
+        if debug:
+            debug_dir = "debug_output"
+            if os.path.exists(debug_dir):
+                shutil.rmtree(debug_dir)
+            os.makedirs(debug_dir)
 
-            config = f"--psm {self.psm} -l {self.lang} --tessdata-dir {self.tessdata_dir}"
-            text = pytesseract.image_to_string(resize, config=config)
+        try:
+            image = cv2.imread(image_path)
+            if image is None:
+                raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
 
-            digits = ''.join(filter(str.isdigit, text))
-            print(f"[OCR] Row {i+1}: '{text.strip()}' → '{digits}'")
-            results.append(digits if digits else None)
+            # Шаг 1: Найти и выровнять экран
+            lcd_image = self.extract_lcd_screen(image)
 
-        return results
+            # Шаг 2: Применить морфологию для получения бинарного изображения
+            binary_lcd = self.morf_closed(lcd_image)
 
-    def process(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
+            # Шаг 3: Распознать цифры на бинарном изображении
+            values = self.recognize_7_segment(binary_lcd, debug=debug)
 
-        lcd = self.extract_lcd_screen(image)
-        # cv2.imwrite("lcd.jpg", lcd)
+            return values
 
-        values = self.extract_values_from_lcd(lcd)
-        if len(values) == 3:
-            print(f"[RESULT] SYS: {values[0]}, DIA: {values[1]}, PULSE: {values[2]}")
-        else:
-            print("[WARN] Не все значения получены:", values)
-        return values
-    def process_full(self, image_path):
-        image = cv2.imread(image_path)
-        if image is None:
-            raise FileNotFoundError(f"Не удалось загрузить изображение: {image_path}")
-        lcd = self.extract_lcd_screen(image)
-        morf_closed = self.morf_closed(lcd)
-        config = f"--psm 3 -l ssd --tessdata-dir tessdata"
-        text = pytesseract.image_to_string(morf_closed, config=config)
-        values = text.strip().splitlines()
-        print(values)
-        return values
+        except (ValueError, FileNotFoundError) as e:
+            print(f"[ERROR] Ошибка обработки: {e}")
+            return None
 
 
+# --- ПРИМЕР ИСПОЛЬЗОВАНИЯ КЛАССА ---
+if __name__ == '__main__':
+    # Путь к вашему изображению тонометра
+    image_file_path = 'IMG_2033 2 Medium.jpeg'  # ЗАМЕНИТЕ НА ВАШ ФАЙЛ
 
+    # Создаем экземпляр нашего класса
+    ocr_processor = TonometerOCR()
+
+    # Запускаем новый процесс распознавания
+    # Включаем debug=True, чтобы сохранялись промежуточные изображения
+    results = ocr_processor.process_with_7_segment_ocr(image_file_path, debug=True)
+    print(results)
 
